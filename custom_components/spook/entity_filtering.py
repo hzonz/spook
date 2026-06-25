@@ -19,6 +19,7 @@ from homeassistant.const import (
     ENTITY_MATCH_NONE,
     EVENT_COMPONENT_LOADED,
     EVENT_HOMEASSISTANT_START,
+    EVENT_STATE_CHANGED,
     Platform,
 )
 from homeassistant.core import (
@@ -39,7 +40,7 @@ from .const import LOGGER
 from .listeners import async_listen_once_tracked
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from homeassistant.core import HomeAssistant
 
@@ -51,6 +52,20 @@ IGNORED_ENTITY_DOMAINS = (
     "persistent_notification.",
     "scene.",
 )
+
+# Home Assistant's legacy time_date platform can create these entity IDs without
+# entity-registry entries. Treat them as known so references to configured
+# time/date sensors are not reported as unknown when they are not in the state
+# machine during an inspection.
+KNOWN_TIME_DATE_ENTITY_IDS = {
+    "sensor.time",
+    "sensor.date",
+    "sensor.date_time",
+    "sensor.date_time_utc",
+    "sensor.date_time_iso",
+    "sensor.time_date",
+    "sensor.time_utc",
+}
 
 # Additional known domains that are not in the Platform enum
 ADDITIONAL_DOMAINS = [
@@ -119,6 +134,10 @@ ENTITY_ID_TEMPLATE_PATTERNS = [
     # Entity IDs followed by filter functions (entity_id | function)
     rf"['\"]({ENTITY_ID_PATTERN})['\"](?:\s*\|\s*(?:{'|'.join(_ENTITY_FUNCTIONS)}))",
 ]
+COMPILED_ENTITY_ID_TEMPLATE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE) for pattern in ENTITY_ID_TEMPLATE_PATTERNS
+)
+JINJA_COMMENT_PATTERN = re.compile(r"\{#.*?#\}", re.DOTALL)
 
 _CACHED_ALL_ENTITY_IDS: set[str] | None = None
 _UNSUB_CACHE_INVALIDATION: Callable[[], None] | None = None
@@ -151,6 +170,13 @@ def async_setup_all_entity_ids_cache_invalidation(
 
     LOGGER.debug("Setting up Spook's all_entity_ids cache invalidation listeners.")
 
+    @callback
+    def _state_entity_changed(event_data: Mapping[str, Any]) -> bool:
+        """Return if a state was added or removed."""
+        return (
+            event_data.get("old_state") is None or event_data.get("new_state") is None
+        )
+
     # Listen for entity registry updates
     unsub_registry_update = hass.bus.async_listen(
         er.EVENT_ENTITY_REGISTRY_UPDATED, _clear_all_entity_ids_cache
@@ -162,6 +188,12 @@ def async_setup_all_entity_ids_cache_invalidation(
     # Listen for components loading
     unsub_component_loaded = hass.bus.async_listen(
         EVENT_COMPONENT_LOADED, _clear_all_entity_ids_cache
+    )
+    # Listen for state-only entities being added or removed.
+    unsub_state_changed = hass.bus.async_listen(
+        EVENT_STATE_CHANGED,
+        _clear_all_entity_ids_cache,
+        event_filter=_state_entity_changed,
     )
 
     # Perform an initial clear, just in case.
@@ -176,6 +208,7 @@ def async_setup_all_entity_ids_cache_invalidation(
         unsub_registry_update()
         unsub_hass_start()
         unsub_component_loaded()
+        unsub_state_changed()
         _UNSUB_CACHE_INVALIDATION = None  # Mark as unsubscribed
 
     _UNSUB_CACHE_INVALIDATION = _unsubscribe_listeners
@@ -186,7 +219,7 @@ def async_setup_all_entity_ids_cache_invalidation(
 def async_get_all_entity_ids(
     hass: HomeAssistant, *, include_all_none: bool = False
 ) -> set[str]:
-    """Return all entity IDs, known to Home Assistant, using a cache."""
+    """Return entity IDs known to Home Assistant or treated as known by Spook."""
     # pylint: disable-next=global-statement
     global _CACHED_ALL_ENTITY_IDS  # noqa: PLW0603
 
@@ -200,7 +233,10 @@ def async_get_all_entity_ids(
         }
         entity_ids_from_states = hass.states.async_entity_ids()
 
-        combined_entity_ids = entity_ids_from_registry.union(entity_ids_from_states)
+        combined_entity_ids = entity_ids_from_registry.union(
+            entity_ids_from_states,
+            KNOWN_TIME_DATE_ENTITY_IDS,
+        )
 
         # Filter out ignored domains
         _CACHED_ALL_ENTITY_IDS = {
@@ -373,7 +409,9 @@ def is_template_string(value: str) -> bool:
 
 
 async def async_extract_entities_from_template_string(
-    hass: HomeAssistant, template_str: str
+    hass: HomeAssistant,
+    template_str: str,
+    known_services: set[str] | None = None,
 ) -> set[str]:
     """Extract entity IDs from a template string using regex analysis.
 
@@ -387,7 +425,9 @@ async def async_extract_entities_from_template_string(
 
     # Use regex patterns to find entities
     try:
-        regex_entities = extract_entities_from_template_regex(hass, template_str)
+        regex_entities = extract_entities_from_template_regex(
+            hass, template_str, known_services
+        )
         entities.update(regex_entities)
     # pylint: disable-next=broad-exception-caught
     except Exception as exc:  # noqa: BLE001 - Keep broad for unexpected regex issues
@@ -398,6 +438,13 @@ async def async_extract_entities_from_template_string(
         )
 
     return entities
+
+
+def _strip_jinja_comments(template_str: str) -> str:
+    """Remove Jinja comments from a template string."""
+    if "{#" not in template_str:
+        return template_str
+    return JINJA_COMMENT_PATTERN.sub("", template_str)
 
 
 def _is_concatenated_template_match(template_str: str, match: re.Match[str]) -> bool:
@@ -418,6 +465,59 @@ def _is_concatenated_template_match(template_str: str, match: re.Match[str]) -> 
     return before_literal.endswith("~") or after_literal.startswith("~")
 
 
+def _is_jinja_import_match(template_str: str, match: re.Match[str]) -> bool:
+    """Return if a quoted entity-like literal is a Jinja import filename."""
+    groups = match.groups()
+    if len(groups) == _STATES_DOMAIN_ENTITY_GROUPS:
+        return False
+
+    entity_start, entity_end = match.span(1)
+    block_start = template_str.rfind("{%", 0, entity_start)
+    expression_start = template_str.rfind("{{", 0, entity_start)
+    if block_start == -1 or expression_start > block_start:
+        return False
+
+    block_end = template_str.find("%}", entity_end)
+    expression_end = template_str.find("}}", entity_end)
+    if block_end == -1 or (expression_end != -1 and expression_end < block_end):
+        return False
+
+    block = template_str[block_start : block_end + 2]
+    return bool(
+        re.match(
+            r"\{%-?\s*(?:from\s+['\"][^'\"]+['\"]\s+import|import\s+['\"][^'\"]+['\"]\s+as)",
+            block,
+        )
+    )
+
+
+def _is_string_method_argument_match(template_str: str, match: re.Match[str]) -> bool:
+    """Return if an entity-like literal is used as a string method argument."""
+    groups = match.groups()
+    if len(groups) == _STATES_DOMAIN_ENTITY_GROUPS:
+        return False
+
+    entity_start = match.span(1)[0]
+    before_entity = template_str[:entity_start].rstrip()
+    if not before_entity.endswith(("'", '"')):
+        return False
+
+    before_literal = before_entity[:-1].rstrip()
+    for method in (".startswith", ".endswith"):
+        if method not in before_literal:
+            continue
+
+        after_method = before_literal.rsplit(method, maxsplit=1)[1].lstrip()
+        if not after_method.startswith("("):
+            continue
+
+        between_call_and_argument = after_method[1:].strip()
+        if not between_call_and_argument or set(between_call_and_argument) == {"("}:
+            return True
+
+    return False
+
+
 def _entity_id_from_template_match(match: re.Match[str]) -> str:
     """Return the entity ID captured by a template regex match."""
     groups = match.groups()
@@ -430,7 +530,9 @@ def _entity_id_from_template_match(match: re.Match[str]) -> str:
 
 
 def extract_entities_from_template_regex(
-    hass: HomeAssistant, template_str: str
+    hass: HomeAssistant,
+    template_str: str,
+    known_services: set[str] | None = None,
 ) -> set[str]:
     """Extract entity IDs from template string using regex patterns.
 
@@ -442,11 +544,17 @@ def extract_entities_from_template_regex(
     if not isinstance(template_str, str):
         return set()
 
+    template_without_comments = _strip_jinja_comments(template_str)
+
     entities = set()
 
-    for pattern in ENTITY_ID_TEMPLATE_PATTERNS:
-        for match in re.finditer(pattern, template_str, re.IGNORECASE):
-            if _is_concatenated_template_match(template_str, match):
+    for pattern in COMPILED_ENTITY_ID_TEMPLATE_PATTERNS:
+        for match in pattern.finditer(template_without_comments):
+            if (
+                _is_concatenated_template_match(template_without_comments, match)
+                or _is_jinja_import_match(template_without_comments, match)
+                or _is_string_method_argument_match(template_without_comments, match)
+            ):
                 continue
 
             entity_id = _entity_id_from_template_match(match)
@@ -457,7 +565,8 @@ def extract_entities_from_template_regex(
                     entities.add(individual_id)
 
     # Filter out known services to avoid false positives
-    known_services = async_get_all_services(hass)
+    if known_services is None:
+        known_services = async_get_all_services(hass)
     return entities - known_services
 
 
@@ -465,6 +574,7 @@ async def _process_template_object(
     hass: HomeAssistant,
     template: Template,
     known_entity_ids: set[str],
+    known_services: set[str],
     unknown_entities: set[str],
 ) -> None:
     """Process a Template object and add unknown entities to the set."""
@@ -474,7 +584,7 @@ async def _process_template_object(
     try:
         if hasattr(template, "template") and template.template:
             regex_entities = extract_entities_from_template_regex(
-                hass, template.template
+                hass, template.template, known_services
             )
             template_entities.update(regex_entities)
     # pylint: disable-next=broad-exception-caught
@@ -491,11 +601,12 @@ async def _process_template_string(
     hass: HomeAssistant,
     template_str: str,
     known_entity_ids: set[str],
+    known_services: set[str],
     unknown_entities: set[str],
 ) -> None:
     """Process a template string and add unknown entities to the set."""
     template_entities = await async_extract_entities_from_template_string(
-        hass, template_str
+        hass, template_str, known_services
     )
     # Check if any of the template entities are unknown
     for template_entity in template_entities:
@@ -521,14 +632,17 @@ async def async_filter_known_entity_ids_with_templates(
     """
     if known_entity_ids is None:
         known_entity_ids = async_get_all_entity_ids(hass)
+    known_services: set[str] | None = None
 
     unknown_entities = set()
 
     for entity_id_raw in entity_ids:
         # Handle Template objects
         if isinstance(entity_id_raw, Template):
+            if known_services is None:
+                known_services = async_get_all_services(hass)
             await _process_template_object(
-                hass, entity_id_raw, known_entity_ids, unknown_entities
+                hass, entity_id_raw, known_entity_ids, known_services, unknown_entities
             )
             continue
 
@@ -537,8 +651,10 @@ async def async_filter_known_entity_ids_with_templates(
 
         # Check if this looks like a template string
         if is_template_string(entity_id_raw):
+            if known_services is None:
+                known_services = async_get_all_services(hass)
             await _process_template_string(
-                hass, entity_id_raw, known_entity_ids, unknown_entities
+                hass, entity_id_raw, known_entity_ids, known_services, unknown_entities
             )
         else:
             # Process as regular entity ID(s), handling comma-separated lists
@@ -605,13 +721,19 @@ async def async_extract_entities_from_config(
         return entities
 
     template_strings = extract_template_strings_from_config(config)
+    known_services = async_get_all_services(hass) if template_strings else set()
+    extracted_templates: dict[str, set[str]] = {}
     for template_str in template_strings:
         try:
             # async_extract_entities_from_template_string already handles
             # TemplateError and other exceptions internally, logging them.
-            referenced_entities = await async_extract_entities_from_template_string(
-                hass, template_str
-            )
+            if template_str not in extracted_templates:
+                extracted_templates[
+                    template_str
+                ] = await async_extract_entities_from_template_string(
+                    hass, template_str, known_services
+                )
+            referenced_entities = extracted_templates[template_str]
             entities.update(referenced_entities)
         # pylint: disable-next=broad-exception-caught
         except Exception as exc:  # noqa: BLE001 - Keep broad for unexpected issues
@@ -632,20 +754,15 @@ def async_find_services_in_sequence(  # noqa: C901
     """Find all services called in a sequence."""
     called_services: set[str] = set()
     for step in sequence:
+        if step.get(CONF_ENABLED) is False:
+            continue
+
         action = cv.determine_script_action(step)
 
-        if (
-            action == cv.SCRIPT_ACTION_CALL_SERVICE
-            and CONF_SERVICE in step
-            and step.get(CONF_ENABLED, True)
-        ):
+        if action == cv.SCRIPT_ACTION_CALL_SERVICE and CONF_SERVICE in step:
             called_services.add(step[CONF_SERVICE])
 
-        if (
-            action == cv.SCRIPT_ACTION_CALL_SERVICE
-            and "action" in step
-            and step.get(CONF_ENABLED, True)
-        ):
+        if action == cv.SCRIPT_ACTION_CALL_SERVICE and "action" in step:
             called_services.add(step["action"])
 
         if action == cv.SCRIPT_ACTION_CHOOSE:

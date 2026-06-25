@@ -6,7 +6,8 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import automation
-from homeassistant.const import EVENT_COMPONENT_LOADED
+from homeassistant.const import EVENT_COMPONENT_LOADED, EVENT_STATE_CHANGED
+from homeassistant.core import Event, callback
 from homeassistant.helpers import entity_registry as er
 
 from ....const import LOGGER
@@ -21,6 +22,8 @@ from ....entity_filtering import (
 from ....repairs import AbstractSpookEntityComponentUnknownReferencesRepair
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.core import HomeAssistant
 
 
@@ -53,22 +56,25 @@ async def extract_entities_from_automation_config(
         return entities
 
     # Extract entities from trigger config
-    if "trigger" in config:
-        entities.update(
-            await extract_entities_from_trigger_config(hass, config["trigger"])
-        )
+    for key in ("trigger", "triggers"):
+        if key in config:
+            entities.update(
+                await extract_entities_from_trigger_config(hass, config[key])
+            )
 
     # Extract entities from condition config
-    if "condition" in config:
-        entities.update(
-            await extract_entities_from_condition_config(hass, config["condition"])
-        )
+    for key in ("condition", "conditions"):
+        if key in config:
+            entities.update(
+                await extract_entities_from_condition_config(hass, config[key])
+            )
 
     # Extract entities from action config
-    if "action" in config:
-        entities.update(
-            await extract_entities_from_action_config(hass, config["action"])
-        )
+    for key in ("action", "actions"):
+        if key in config:
+            entities.update(
+                await extract_entities_from_action_config(hass, config[key])
+            )
 
     return entities
 
@@ -105,6 +111,34 @@ async def extract_entities_from_trigger_config(
             entities.update(await extract_entities_from_trigger_config(hass, value))
 
     return entities
+
+
+def extract_event_types_from_trigger_config(config: dict[str, Any] | list) -> set[str]:
+    """Extract event types from trigger configuration."""
+    event_types = set()
+
+    if not config:
+        return event_types
+
+    if isinstance(config, list):
+        for item in config:
+            event_types.update(extract_event_types_from_trigger_config(item))
+        return event_types
+
+    if not isinstance(config, dict):
+        return event_types
+
+    value = config.get("event_type")
+    if isinstance(value, str):
+        event_types.add(value)
+    elif isinstance(value, list):
+        event_types.update(item for item in value if isinstance(item, str))
+
+    for value in config.values():
+        if isinstance(value, (dict, list)):
+            event_types.update(extract_event_types_from_trigger_config(value))
+
+    return event_types
 
 
 async def extract_entities_from_condition_config(
@@ -294,6 +328,31 @@ class SpookRepair(AbstractSpookEntityComponentUnknownReferencesRepair):
 
     _known_entity_ids: set[str]
 
+    async def async_activate(self) -> None:
+        """Activate the repair."""
+        await super().async_activate()
+
+        @callback
+        def _state_entity_changed(event_data: Mapping[str, Any]) -> bool:
+            """Return if a state entity was added or removed."""
+            return (
+                event_data.get("old_state") is None
+                or event_data.get("new_state") is None
+            )
+
+        @callback
+        def _async_call_inspect_debouncer(_: Event) -> None:
+            """Trigger an inspection when a state entity is added or removed."""
+            self.inspect_debouncer.async_schedule_call()
+
+        self._event_subs.add(
+            self.hass.bus.async_listen(
+                EVENT_STATE_CHANGED,
+                _async_call_inspect_debouncer,
+                event_filter=_state_entity_changed,
+            ),
+        )
+
     async def _async_setup_inspection(self) -> None:
         """Cache known entity IDs (including ALL/NONE) for this inspection cycle."""
         self._known_entity_ids = async_get_all_entity_ids(
@@ -315,6 +374,10 @@ class SpookRepair(AbstractSpookEntityComponentUnknownReferencesRepair):
                     self.hass, entity.raw_config
                 )
             )
+            for key in ("trigger", "triggers"):
+                all_entities.difference_update(
+                    extract_event_types_from_trigger_config(entity.raw_config.get(key))
+                )
 
         # Extract entities from Template objects within the automation entity
         all_entities.update(

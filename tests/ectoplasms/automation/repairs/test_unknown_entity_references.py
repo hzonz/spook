@@ -7,12 +7,18 @@ so the upcoming consolidation into a single recursive walker cannot regress them
 silently.
 """
 
-# pylint: disable=wrong-import-order
+# ruff: noqa: SLF001
+# pylint: disable=protected-access,too-few-public-methods,wrong-import-order
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from types import SimpleNamespace
+
+from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import State
 
 from custom_components.spook.ectoplasms.automation.repairs.unknown_entity_references import (
+    SpookRepair,
     extract_entities_from_action_config,
     extract_entities_from_automation_config,
     extract_entities_from_condition_config,
@@ -22,7 +28,23 @@ from custom_components.spook.ectoplasms.automation.repairs.unknown_entity_refere
 import pytest
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from homeassistant.core import HomeAssistant
+
+
+class MockAutomationEntity:
+    """Mock automation entity."""
+
+    def __init__(
+        self,
+        *,
+        raw_config: dict[str, object],
+        referenced_entities: Iterable[str],
+    ) -> None:
+        """Initialize the mock automation entity."""
+        self.raw_config = raw_config
+        self.referenced_entities = set(referenced_entities)
 
 
 async def test_value_plain_entity_id(hass: HomeAssistant) -> None:
@@ -66,6 +88,91 @@ async def test_value_template_ignores_concatenated_entity_id_literal(
     assert await extract_entities_from_value(hass, template) == set()
 
 
+async def test_value_template_ignores_jinja_import_filename(
+    hass: HomeAssistant,
+) -> None:
+    """Jinja import filenames are not entity references."""
+    template = "{% from 'date.jinja' import how_about_now %}{{ how_about_now() }}"
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
+async def test_value_template_ignores_jinja_import_as_filename(
+    hass: HomeAssistant,
+) -> None:
+    """Jinja import-as filenames are not entity references."""
+    template = "{% import 'date.jinja' as date_helpers %}{{ date_helpers.now() }}"
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
+async def test_value_template_ignores_whitespace_control_jinja_import_filename(
+    hass: HomeAssistant,
+) -> None:
+    """Jinja import filenames with whitespace control are not entity references."""
+    template = "{%- from 'date.jinja' import how_about_now -%}{{ how_about_now() }}"
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
+async def test_value_template_keeps_entity_reference_between_jinja_blocks(
+    hass: HomeAssistant,
+) -> None:
+    """Entity references in expression blocks are not treated as import filenames."""
+    template = (
+        "{% from 'date.jinja' import how_about_now %}"
+        "{{ states('light.kitchen') }}"
+        "{% set finished = true %}"
+    )
+
+    assert await extract_entities_from_value(hass, template) == {"light.kitchen"}
+
+
+async def test_value_template_ignores_entity_id_prefix_string_match(
+    hass: HomeAssistant,
+) -> None:
+    """String prefix checks are not complete entity references."""
+    template = (
+        "{% for entity in states.binary_sensor if "
+        "entity.entity_id.startswith('binary_sensor.proxmox') %}"
+        "{{ entity.state }}"
+        "{% endfor %}"
+    )
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
+async def test_value_template_ignores_grouped_entity_id_prefix_string_match(
+    hass: HomeAssistant,
+) -> None:
+    """String prefix checks can use grouping without becoming references."""
+    template = "{{ entity.entity_id.startswith( ('binary_sensor.proxmox')) }}"
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
+async def test_value_template_ignores_entity_id_suffix_string_match(
+    hass: HomeAssistant,
+) -> None:
+    """String suffix checks are not complete entity references."""
+    template = "{{ entity.entity_id.endswith('sensor.power') }}"
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
+async def test_value_template_ignores_entity_id_in_jinja_comment(
+    hass: HomeAssistant,
+) -> None:
+    """Entity-like strings inside Jinja comments are not active references."""
+    template = (
+        "{# {{ state_translated('sensor.toothbrush_change_head') | string }} "
+        "indicates time to change, toothbrush head #}"
+        "{{ trigger.to_state.attributes.friendly_name | string }}"
+    )
+
+    assert await extract_entities_from_value(hass, template) == set()
+
+
 async def test_value_template_ignores_concatenated_helper_entity_id(
     hass: HomeAssistant,
 ) -> None:
@@ -106,6 +213,38 @@ async def test_trigger_state_entity_id(hass: HomeAssistant) -> None:
     assert await extract_entities_from_trigger_config(hass, config) == {
         "binary_sensor.door"
     }
+
+
+async def test_trigger_event_type_is_not_an_entity_id(
+    hass: HomeAssistant,
+) -> None:
+    """Event trigger ``event_type`` values are not entity references."""
+    config = {
+        "platform": "event",
+        "event_type": "timer.finished",
+        "event_data": {"entity_id": "timer.hot_tub"},
+    }
+    assert await extract_entities_from_trigger_config(hass, config) == {"timer.hot_tub"}
+
+
+async def test_event_trigger_type_reference_is_not_reported_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """Event trigger ``event_type`` references are not unknown entities."""
+    entity = MockAutomationEntity(
+        raw_config={
+            "trigger": {
+                "platform": "event",
+                "event_type": "timer.finished",
+                "event_data": {"entity_id": "timer.hot_tub"},
+            },
+        },
+        referenced_entities={"timer.finished", "timer.hot_tub"},
+    )
+    repair = SpookRepair(hass)
+    repair._known_entity_ids = {"timer.hot_tub"}
+
+    assert await repair._async_compute_unknown_references(entity) == set()
 
 
 async def test_trigger_zone_field(hass: HomeAssistant) -> None:
@@ -305,6 +444,54 @@ async def test_automation_full_config(hass: HomeAssistant) -> None:
     }
 
 
+async def test_automation_full_config_with_plural_keys(hass: HomeAssistant) -> None:
+    """A modern automation config yields entities from plural sections."""
+    config = {
+        "alias": "Test",
+        "triggers": [{"trigger": "state", "entity_id": "binary_sensor.motion"}],
+        "conditions": [
+            {
+                "condition": "state",
+                "entity_id": "input_boolean.snooze_uptime_alerts",
+                "state": "off",
+            }
+        ],
+        "actions": [
+            {"action": "light.turn_on", "target": {"entity_id": "light.kitchen"}},
+        ],
+    }
+
+    assert await extract_entities_from_automation_config(hass, config) == {
+        "binary_sensor.motion",
+        "input_boolean.snooze_uptime_alerts",
+        "light.kitchen",
+    }
+
+
+async def test_plural_condition_entity_is_reported_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """A missing entity in a plural ``conditions`` section is reported."""
+    entity = MockAutomationEntity(
+        raw_config={
+            "conditions": [
+                {
+                    "condition": "state",
+                    "entity_id": "input_boolean.snooze_uptime_alerts",
+                    "state": "off",
+                }
+            ],
+        },
+        referenced_entities=set(),
+    )
+    repair = SpookRepair(hass)
+    repair._known_entity_ids = set()
+
+    assert await repair._async_compute_unknown_references(entity) == {
+        "input_boolean.snooze_uptime_alerts"
+    }
+
+
 async def test_automation_non_dict_returns_empty(hass: HomeAssistant) -> None:
     """A non-dict argument short-circuits to an empty set."""
     assert await extract_entities_from_automation_config(hass, []) == set()
@@ -329,3 +516,71 @@ async def test_automation_missing_sections(hass: HomeAssistant, section: str) ->
         "action": {"binary_sensor.t", "binary_sensor.c"},
     }[section]
     assert result == expected
+
+
+async def test_state_only_entity_addition_rechecks_automation_repairs(
+    hass: HomeAssistant,
+) -> None:
+    """Test state-only entities trigger automation repair rechecks."""
+    repair = SpookRepair(hass)
+    await repair.async_activate()
+    repair.inspect_debouncer.async_shutdown()
+    calls = 0
+
+    def async_schedule_call() -> None:
+        """Capture scheduled inspections."""
+        nonlocal calls
+        calls += 1
+
+    repair.inspect_debouncer = SimpleNamespace(
+        async_schedule_call=async_schedule_call,
+        async_shutdown=lambda: None,
+    )
+
+    hass.bus.async_fire(
+        EVENT_STATE_CHANGED,
+        {
+            "entity_id": "sensor.backup_state",
+            "old_state": None,
+            "new_state": State("sensor.backup_state", "on"),
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert calls == 1
+
+    await repair.async_deactivate()
+
+
+async def test_state_only_entity_update_does_not_recheck_automation_repairs(
+    hass: HomeAssistant,
+) -> None:
+    """Test normal state changes do not trigger automation repair rechecks."""
+    repair = SpookRepair(hass)
+    await repair.async_activate()
+    repair.inspect_debouncer.async_shutdown()
+    calls = 0
+
+    def async_schedule_call() -> None:
+        """Capture scheduled inspections."""
+        nonlocal calls
+        calls += 1
+
+    repair.inspect_debouncer = SimpleNamespace(
+        async_schedule_call=async_schedule_call,
+        async_shutdown=lambda: None,
+    )
+
+    hass.bus.async_fire(
+        EVENT_STATE_CHANGED,
+        {
+            "entity_id": "sensor.backup_state",
+            "old_state": State("sensor.backup_state", "off"),
+            "new_state": State("sensor.backup_state", "on"),
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert calls == 0
+
+    await repair.async_deactivate()
